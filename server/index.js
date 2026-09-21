@@ -1,10 +1,10 @@
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
-import Anthropic from "@anthropic-ai/sdk";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
+import { execFile } from "child_process";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR  = path.join(__dirname, "..", "data");
@@ -29,11 +29,49 @@ function writeJSON(file, data) {
   catch (e) { console.error("Failed to write", file, e.message); }
 }
 function appendUsage(inputTokens, outputTokens) {
-  const u = readJSON(USAGE_FILE, { total_input_tokens: 0, total_output_tokens: 0 });
+  const u = readJSON(USAGE_FILE, { total_input_tokens: 0, total_output_tokens: 0, requests: 0 });
   u.total_input_tokens  += inputTokens  || 0;
   u.total_output_tokens += outputTokens || 0;
+  u.requests = (u.requests || 0) + 1;
   u.last_updated = new Date().toISOString();
   writeJSON(USAGE_FILE, u);
+}
+
+// ── Gemini backend (replaces Anthropic/Claude) ────────────────────
+// Auth goes through the user's connected Gemini credential via the skill's
+// CLI — no API key is ever stored or printed here. The CLI is non-streaming,
+// so we replay the full response to the client as SSE chunks in the exact
+// event format the React frontend already expects ({chunk} / {done}).
+const GEMINI_CLI   = "/home/hatch/workspace/skills/gemini/bin/gemini_generate.py";
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.6-flash";
+
+function callGemini({ prompt, system, json }) {
+  return new Promise((resolve, reject) => {
+    const args = ["--model", GEMINI_MODEL];
+    if (system) { args.push("--system", system); }
+    if (json)   { args.push("--json"); }
+    const child = execFile(
+      "python3",
+      [GEMINI_CLI, ...args],
+      { timeout: 180000, maxBuffer: 8 * 1024 * 1024 },
+      (err, stdout, stderr) => {
+        if (err) return reject(new Error((stderr && stderr.trim()) || err.message));
+        resolve(stdout);
+      }
+    );
+    child.stdin.write(prompt);
+    child.stdin.end();
+  });
+}
+
+// Replay a full text as SSE chunks so the client behaves exactly as before.
+function streamTextSSE(res, text, donePayload) {
+  const CHUNK = 160;
+  for (let i = 0; i < text.length; i += CHUNK) {
+    res.write(`data: ${JSON.stringify({ chunk: text.slice(i, i + CHUNK) })}\n\n`);
+  }
+  res.write(`data: ${JSON.stringify(donePayload)}\n\n`);
+  res.end();
 }
 
 const app = express();
@@ -45,21 +83,8 @@ if (fs.existsSync(BUILD_DIR)) {
   app.use(express.static(BUILD_DIR));
 }
 
-const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-
-// Single source of truth for the model. Override with MODEL=... in server/.env.
-const MODEL = process.env.MODEL || "claude-sonnet-5";
-
-// Question generation and tutoring both hinge on getting the engineering right,
-// so they run with adaptive thinking: the model reasons before answering rather
-// than composing an answer as it writes. The system prompt already asks it to
-// solve the problem and verify its answer appears among the choices — thinking
-// is where that work actually happens.
-//
-// max_tokens caps thinking AND response text together, so any endpoint using
-// this needs a budget well above the size of its visible output; too tight a cap
-// spends the budget on reasoning and truncates the answer.
-const THINKING = { type: "adaptive" };
+// Single source of truth for the model. Override with GEMINI_MODEL=... in server/.env.
+const MODEL = GEMINI_MODEL;
 
 const SYSTEM_PROMPT = `You are an expert civil engineering exam tutor specializing in the NCEES FE Civil CBT exam. You generate realistic, high-quality multiple choice practice questions exactly matching the format and difficulty of the actual FE Civil exam.
 
@@ -95,35 +120,6 @@ JSON format:
   "topic": "Specific subtopic within the area"
 }`;
 
-// Structured-output schema for /api/question. Asking for JSON in the prompt is
-// not a guarantee: the model sometimes prefixed a reasoning preamble or wrapped
-// the object in a ```json fence, which made the client's JSON.parse fail and
-// left the UI stuck on "generating" forever. Constraining the response format
-// makes that class of failure impossible.
-const QUESTION_SCHEMA = {
-  type: "object",
-  properties: {
-    question: { type: "string" },
-    choices: {
-      type: "object",
-      properties: {
-        A: { type: "string" },
-        B: { type: "string" },
-        C: { type: "string" },
-        D: { type: "string" },
-      },
-      required: ["A", "B", "C", "D"],
-      additionalProperties: false,
-    },
-    correct: { type: "string", enum: ["A", "B", "C", "D"] },
-    explanation: { type: "string" },
-    handbook_hint: { type: "string" },
-    topic: { type: "string" },
-  },
-  required: ["question", "choices", "correct", "explanation", "handbook_hint", "topic"],
-  additionalProperties: false,
-};
-
 // ── Generate question (streaming JSON) ──────────────────────────
 app.post("/api/question", async (req, res) => {
   const { topic, difficulty } = req.body;
@@ -142,31 +138,9 @@ Difficulty guidelines:
 Return only the JSON object described in your instructions.`;
 
   try {
-    const stream = client.messages.stream({
-      model: MODEL,
-      // Covers thinking plus the JSON. A hard question's JSON alone runs ~1k
-      // tokens; the rest is headroom for reasoning on the hardest problems.
-      max_tokens: 12000,
-      thinking: THINKING,
-      output_config: { format: { type: "json_schema", schema: QUESTION_SCHEMA } },
-      system: SYSTEM_PROMPT,
-      messages: [{ role: "user", content: prompt }],
-    });
-
-    let full = "";
-    for await (const chunk of stream) {
-      if (chunk.type === "content_block_delta" && chunk.delta?.type === "text_delta") {
-        full += chunk.delta.text;
-        res.write(`data: ${JSON.stringify({ chunk: chunk.delta.text })}\n\n`);
-      }
-    }
-    try {
-      const finalMsg = await stream.finalMessage();
-      appendUsage(finalMsg.usage?.input_tokens, finalMsg.usage?.output_tokens);
-    } catch {}
-
-    res.write(`data: ${JSON.stringify({ done: true, full })}\n\n`);
-    res.end();
+    const full = (await callGemini({ prompt, system: SYSTEM_PROMPT, json: true })).trim();
+    appendUsage(0, 0);
+    streamTextSSE(res, full, { done: true, full });
   } catch (err) {
     res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`);
     res.end();
@@ -197,30 +171,20 @@ ORIGINAL EXPLANATION: ${explanation}
 
 Help the student understand this problem. Be precise, use step-by-step reasoning, and if they're still confused try a different explanation approach. Be encouraging but technically accurate.`;
 
-  const apiMessages = messages.length === 0
-    ? [{ role: "user", content: context + "\n\n" + req.body.followUp }]
-    : messages;
+  // Convert the client's message history into a plain transcript for Gemini.
+  const transcript = (messages && messages.length > 0)
+    ? messages.map(m => {
+        const role = (m.role === "assistant" || m.role === "model") ? "Tutor" : "Student";
+        const text = typeof m.content === "string" ? m.content
+          : Array.isArray(m.content) ? m.content.map(p => p.text || "").join("") : "";
+        return `${role}: ${text}`;
+      }).join("\n\n")
+    : `Student: ${req.body.followUp || "Please explain this question."}`;
 
   try {
-    const stream = client.messages.stream({
-      model: MODEL,
-      max_tokens: 5000,
-      thinking: THINKING,
-      messages: apiMessages,
-    });
-
-    for await (const chunk of stream) {
-      if (chunk.type === "content_block_delta" && chunk.delta?.type === "text_delta") {
-        res.write(`data: ${JSON.stringify({ chunk: chunk.delta.text })}\n\n`);
-      }
-    }
-    try {
-      const finalMsg = await stream.finalMessage();
-      appendUsage(finalMsg.usage?.input_tokens, finalMsg.usage?.output_tokens);
-    } catch {}
-
-    res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
-    res.end();
+    const reply = (await callGemini({ prompt: context + "\n\n" + transcript })).trim();
+    appendUsage(0, 0);
+    streamTextSSE(res, reply, { done: true });
   } catch (err) {
     res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`);
     res.end();
@@ -260,39 +224,19 @@ app.post("/api/formula-lookup", async (req, res) => {
   res.setHeader("Cache-Control", "no-cache");
   res.setHeader("Connection", "keep-alive");
 
-  try {
-    const stream = client.messages.stream({
-      model: MODEL,
-      max_tokens: 900,
-      // Deliberately no thinking here, unlike the question and tutor endpoints.
-      // This is the mid-problem "where is that table" lookup, where latency is
-      // the whole point and the task is recall rather than derivation.
-      thinking: { type: "disabled" },
-      messages: [{
-        role: "user",
-        content: `You are an FE Civil exam reference assistant. The student is looking up: "${query}"
+  const prompt = `You are an FE Civil exam reference assistant. The student is looking up: "${query}"
 
 Provide:
 1. The relevant formula(s) with all variables clearly defined
 2. The exact section name in the NCEES FE Reference Handbook where this is found
 3. Units and any critical notes about common application mistakes
 
-Be concise and precise — this is quick reference during exam practice.`,
-      }],
-    });
+Be concise and precise — this is quick reference during exam practice.`;
 
-    for await (const chunk of stream) {
-      if (chunk.type === "content_block_delta" && chunk.delta?.type === "text_delta") {
-        res.write(`data: ${JSON.stringify({ chunk: chunk.delta.text })}\n\n`);
-      }
-    }
-    try {
-      const finalMsg = await stream.finalMessage();
-      appendUsage(finalMsg.usage?.input_tokens, finalMsg.usage?.output_tokens);
-    } catch {}
-
-    res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
-    res.end();
+  try {
+    const reply = (await callGemini({ prompt })).trim();
+    appendUsage(0, 0);
+    streamTextSSE(res, reply, { done: true });
   } catch (err) {
     res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`);
     res.end();
@@ -304,32 +248,22 @@ app.get("/api/history", (_, res) => res.json(readJSON(QUESTION_HIST_FILE, [])));
 app.get("/api/tutor-history", (_, res) => res.json(readJSON(TUTOR_HIST_FILE, [])));
 
 // ── Usage stats ──────────────────────────────────────────────────
+// Gemini free tier: $0. Token counts aren't reported by the CLI, so we track
+// request counts only.
 app.get("/api/usage", (_, res) => {
-  const u = readJSON(USAGE_FILE, { total_input_tokens: 0, total_output_tokens: 0 });
-  // claude-sonnet: $3/MTok input, $15/MTok output
-  const cost = (u.total_input_tokens * 3 + u.total_output_tokens * 15) / 1_000_000;
-  res.json({ ...u, estimated_cost_usd: Math.round(cost * 10000) / 10000 });
+  const u = readJSON(USAGE_FILE, { total_input_tokens: 0, total_output_tokens: 0, requests: 0 });
+  res.json({ ...u, model: MODEL, estimated_cost_usd: 0 });
 });
 
-// ── Heartbeat + auto-shutdown ────────────────────────────────────
-let _shutdownTimer = null;
-function scheduleShutdown() {
-  if (_shutdownTimer) clearTimeout(_shutdownTimer);
-  _shutdownTimer = setTimeout(() => {
-    console.log("\n👋  Browser tab closed — shutting down.\n");
-    process.exit(0);
-  }, 15000);
-}
-// Give browser 30 seconds to open before expecting heartbeats
-setTimeout(scheduleShutdown, 30000);
-
+// ── Heartbeat ────────────────────────────────────────────────────
+// NOTE: the original auto-shutdown (exit 15s after the browser tab closes) is
+// disabled here so the app stays up behind the tunnel for iPhone access.
 app.post("/api/heartbeat", (_, res) => {
-  scheduleShutdown();
   res.json({ ok: true });
 });
 
 // ── Health check ─────────────────────────────────────────────────
-app.get("/api/health", (_, res) => res.json({ ok: true }));
+app.get("/api/health", (_, res) => res.json({ ok: true, model: MODEL }));
 
 // ── SPA catch-all (must be last) ─────────────────────────────────
 if (fs.existsSync(BUILD_DIR)) {
@@ -337,4 +271,4 @@ if (fs.existsSync(BUILD_DIR)) {
 }
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`\n✅ FE Civil app running on http://localhost:${PORT}\n`));
+app.listen(PORT, () => console.log(`\n✅ FE Civil app running on http://localhost:${PORT} (Gemini: ${MODEL})\n`));
